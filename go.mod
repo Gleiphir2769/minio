@@ -27,6 +27,7 @@ require (
 	github.com/fatih/structs v1.1.0
 	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/go-sql-driver/mysql v1.6.0
+	github.com/gocql/gocql v1.1.0
 	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/gomodule/redigo v2.0.0+incompatible
 	github.com/google/uuid v1.1.1
