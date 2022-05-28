@@ -36,4 +36,6 @@ import (
 	// gateway functionality is frozen, no new gateways are being implemented
 	// or considered for upstream inclusion at this point in time. if needed
 	// please keep a fork of the project.
+
+	_ "github.com/minio/minio/cmd/gateway/cassandra"
 )

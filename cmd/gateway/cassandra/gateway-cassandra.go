@@ -2,18 +2,25 @@ package cassandra
 
 import (
 	"context"
+	"fmt"
 	"github.com/gocql/gocql"
 	"github.com/minio/cli"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 	minio "github.com/minio/minio/cmd"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
 const (
 	cassandraSeparator = minio.SlashSeparator
+	bucketManager      = "managed_buckets"
+	reservedBuckets    = "managed_buckets"
 )
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyz01234569"
@@ -56,8 +63,13 @@ func (c *Cassandra) Name() string {
 }
 
 func (c *Cassandra) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
+	cluster := os.Getenv("CASSANDRA_CLUSTER")
 	co := &cassandraObjects{}
-	co.cluster = gocql.NewCluster("10.112.186.147")
+	co.cluster = gocql.NewCluster(cluster)
+	err := co.createManagedBucketsTable()
+	if err != nil {
+		return nil, err
+	}
 	return co, nil
 }
 
@@ -68,6 +80,7 @@ func (c *Cassandra) Production() bool {
 type cassandraObjects struct {
 	minio.GatewayUnsupported
 	cluster *gocql.ClusterConfig
+	// todo: session池化
 	session *gocql.Session
 }
 
@@ -80,26 +93,47 @@ func (co *cassandraObjects) StorageInfo(ctx context.Context, _ bool) (si minio.S
 }
 
 func (co *cassandraObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
-	return nil
+	if !cassandraIsValidBucketName(bucket) {
+		return minio.BucketNameInvalid{Bucket: bucket}
+	}
+	return cassandraToObjectErr(ctx, co.deleteBucket(bucket), bucket)
 }
 
 func (co *cassandraObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts minio.BucketOptions) error {
-	return nil
+	if opts.LockEnabled || opts.VersioningEnabled {
+		return minio.NotImplemented{}
+	}
+	if !cassandraIsValidBucketName(bucket) {
+		return minio.BucketNameInvalid{Bucket: bucket}
+	}
+	return cassandraToObjectErr(ctx, co.createBucket(bucket), bucket)
 }
 
 func (co *cassandraObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, err error) {
-	return minio.BucketInfo{}, err
+	createTime, err := co.getBucketCreateTime(bucket)
+	if err != nil {
+		return bi, cassandraToObjectErr(ctx, err, bucket)
+	}
+	// As hdfs.Stat() doesn't carry anything other than ModTime(), use ModTime() as CreatedTime.
+	return minio.BucketInfo{
+		Name:    bucket,
+		Created: *createTime,
+	}, nil
 }
 
 func (co *cassandraObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
 	session, err := co.cluster.CreateSession()
+	defer session.Close()
 	if err != nil {
 		return nil, err
 	}
-	iter := session.Query("SELECT table_name FROM system_schema.columns WHERE keyspace_name = 'store';").Iter().Scanner()
+	iter := session.Query("SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'minio';").Iter().Scanner()
 	var tableName string
 	for iter.Next() {
 		_ = iter.Scan(&tableName)
+		if isBucketReserved(tableName) {
+			continue
+		}
 		buckets = append(buckets, minio.BucketInfo{
 			Name: tableName,
 			// As hdfs.Stat() doesnt carry CreatedTime, use ModTime() as CreatedTime.
@@ -180,6 +214,140 @@ func (co *cassandraObjects) AbortMultipartUpload(ctx context.Context, bucket, ob
 	return err
 }
 
+func (co *cassandraObjects) createManagedBucketsTable() error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if err = s.Query("CREATE TABLE IF NOT EXISTS minio.managed_buckets (bucket_name text PRIMARY KEY, create_timestamp timestamp);").Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (co *cassandraObjects) createBucket(bucket string) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("CREATE TABLE minio.%s (\nuploadid text PRIMARY KEY,\ndata blob,\ncreate_timestamp timestamp\n);", bucket)
+	if err = s.Query(cql).Exec(); err != nil {
+		return err
+	}
+	// todo: 需要保证创建和注册的原子性
+	return co.registerBucket(bucket)
+}
+
+func (co *cassandraObjects) registerBucket(bucket string) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("INSERT INTO minio.%s (bucket_name, create_timestamp) VALUES(?, ?);", bucketManager)
+	if err = s.Query(cql, bucket, time.Now()).Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (co *cassandraObjects) deregisterBucket(bucket string) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("DELETE FROM minio.%s where bucket_name=?;", bucketManager)
+	if err = s.Query(cql, bucket).Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (co *cassandraObjects) deleteBucket(bucket string) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("DROP TABLE minio.%s", bucket)
+	if err = s.Query(cql).Exec(); err != nil {
+		return err
+	}
+	return co.deregisterBucket(bucket)
+}
+
+func (co *cassandraObjects) getBucketCreateTime(bucket string) (*time.Time, error) {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	var createTime time.Time
+	cql := fmt.Sprintf("SELECT create_timestamp FROM minio.%s where bucket_name=? LIMIT 1", bucketManager)
+	if err = s.Query(cql, bucket).
+		Consistency(gocql.One).Scan(&createTime); err != nil {
+		return nil, err
+	}
+	return &createTime, nil
+}
+
+func isBucketReserved(bucket string) bool {
+	return strings.Contains(reservedBuckets, bucket)
+}
+
+// cassandraIsValidBucketName verifies whether a bucket name is valid.
+func cassandraIsValidBucketName(bucket string) bool {
+	return s3utils.CheckValidBucketNameStrict(bucket) == nil
+}
+
+func cassandraToObjectErr(ctx context.Context, err error, params ...string) error {
+	if err == nil {
+		return nil
+	}
+	bucket := ""
+	object := ""
+	uploadID := ""
+	switch len(params) {
+	case 3:
+		uploadID = params[2]
+		fallthrough
+	case 2:
+		object = params[1]
+		fallthrough
+	case 1:
+		bucket = params[0]
+	}
+
+	switch err.(type) {
+	case *gocql.RequestErrUnavailable:
+		if uploadID != "" {
+			return minio.InvalidUploadID{
+				UploadID: uploadID,
+			}
+		}
+		if object != "" {
+			return minio.ObjectNotFound{Bucket: bucket, Object: object}
+		}
+		return minio.BucketNotFound{Bucket: bucket}
+	case *gocql.RequestErrAlreadyExists:
+		if object != "" {
+			return minio.PrefixAccessDenied{Bucket: bucket, Object: object}
+		}
+		return minio.BucketAlreadyOwnedByYou{Bucket: bucket}
+	case *WaitToImplementError:
+		if object != "" {
+			return minio.PrefixAccessDenied{Bucket: bucket, Object: object}
+		}
+		return minio.BucketNotEmpty{Bucket: bucket}
+	default:
+		logger.LogIf(ctx, err)
+		return err
+	}
+}
+
 // randString generates random names and prepends them with a known prefix.
 func randString(n int, src rand.Source, prefix string) string {
 	b := make([]byte, n)
@@ -196,4 +364,12 @@ func randString(n int, src rand.Source, prefix string) string {
 		remain--
 	}
 	return prefix + string(b[0:30-len(prefix)])
+}
+
+type WaitToImplementError struct {
+}
+
+func (e *WaitToImplementError) Error() string {
+	panic("wait to implement")
+	return "wait to implement"
 }
