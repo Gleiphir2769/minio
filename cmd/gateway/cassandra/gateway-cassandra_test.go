@@ -7,12 +7,18 @@ import (
 )
 
 func TestCassandra(t *testing.T) {
-	cluster := gocql.NewCluster("192.168.1.1", "192.168.1.2", "192.168.1.3")
-	cluster.Keyspace = "store"
+	cluster := gocql.NewCluster("10.112.186.147")
+	//cluster.Keyspace = "store"
 	session, err := cluster.CreateSession()
 	if err != nil {
 		t.Error(err)
 	}
-	q := session.Query("list tables")
-	fmt.Printf(q.String())
+	//var text string
+	iter := session.Query("SELECT writetime(firstname) FROM system_schema.columns WHERE keyspace_name = 'store' AND table_name = 'shopping_cart';").Iter()
+	m, _ := iter.SliceMap()
+	fmt.Println(len(m))
+	for _, v := range m {
+		fmt.Println(v)
+		fmt.Println(string(v["column_name_bytes"].([]byte)))
+	}
 }

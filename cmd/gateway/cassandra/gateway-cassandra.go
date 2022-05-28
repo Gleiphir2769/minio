@@ -2,13 +2,73 @@ package cassandra
 
 import (
 	"context"
+	"github.com/gocql/gocql"
+	"github.com/minio/cli"
 	minio "github.com/minio/minio/cmd"
+	"github.com/minio/minio/pkg/auth"
 	"io"
+	"math/rand"
 	"net/http"
+	"time"
 )
+
+const (
+	cassandraSeparator = minio.SlashSeparator
+)
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyz01234569"
+const (
+	letterIdxBits = 6                    // 6 bits to represent a letter index
+	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
+	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
+)
+
+func init() {
+	const cassandraGatewayTemplate = `This is a TEST cassandra gateway demo.`
+
+	err := minio.RegisterGatewayCommand(cli.Command{
+		Name:               minio.CassandraBackendGateway,
+		Usage:              "Amazon Cassandra",
+		Action:             cassandraGatewayMain,
+		CustomHelpTemplate: cassandraGatewayTemplate,
+		HideHelpCommand:    true,
+	})
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Handler for 'minio gateway hdfs' command line.
+func cassandraGatewayMain(ctx *cli.Context) {
+	// Validate gateway arguments.
+	if ctx.Args().First() == "help" {
+		cli.ShowCommandHelpAndExit(ctx, minio.CassandraBackendGateway, 1)
+	}
+	minio.StartGateway(ctx, &Cassandra{args: ctx.Args()})
+}
+
+type Cassandra struct {
+	args []string
+}
+
+func (c *Cassandra) Name() string {
+	return minio.CassandraBackendGateway
+}
+
+func (c *Cassandra) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
+	co := &cassandraObjects{}
+	co.cluster = gocql.NewCluster("10.112.186.147")
+	return co, nil
+}
+
+func (c *Cassandra) Production() bool {
+	return true
+}
 
 type cassandraObjects struct {
 	minio.GatewayUnsupported
+	cluster *gocql.ClusterConfig
+	session *gocql.Session
 }
 
 func (co *cassandraObjects) Shutdown(ctx context.Context) error {
@@ -32,6 +92,20 @@ func (co *cassandraObjects) GetBucketInfo(ctx context.Context, bucket string) (b
 }
 
 func (co *cassandraObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
+	session, err := co.cluster.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+	iter := session.Query("SELECT table_name FROM system_schema.columns WHERE keyspace_name = 'store';").Iter().Scanner()
+	var tableName string
+	for iter.Next() {
+		_ = iter.Scan(&tableName)
+		buckets = append(buckets, minio.BucketInfo{
+			Name: tableName,
+			// As hdfs.Stat() doesnt carry CreatedTime, use ModTime() as CreatedTime.
+			Created: time.Now(),
+		})
+	}
 	return buckets, nil
 }
 
@@ -104,4 +178,22 @@ func (co *cassandraObjects) CompleteMultipartUpload(ctx context.Context, bucket,
 
 func (co *cassandraObjects) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts minio.ObjectOptions) (err error) {
 	return err
+}
+
+// randString generates random names and prepends them with a known prefix.
+func randString(n int, src rand.Source, prefix string) string {
+	b := make([]byte, n)
+	// A rand.Int63() generates 63 random bits, enough for letterIdxMax letters!
+	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = src.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+	return prefix + string(b[0:30-len(prefix)])
 }
