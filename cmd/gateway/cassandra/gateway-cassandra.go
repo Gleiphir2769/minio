@@ -144,13 +144,39 @@ func (co *cassandraObjects) ListBuckets(ctx context.Context) (buckets []minio.Bu
 }
 
 func (co *cassandraObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
-
-	return loi, err
+	if len(prefix) > 0 {
+		return loi, minio.NotImplemented{API: "Bucket Prefix not Implemented"}
+	}
+	objectInfos, err := co.getObjectInfos(bucket)
+	if err != nil {
+		return loi, err
+	}
+	return minio.ListObjectsInfo{
+		IsTruncated: false,
+		NextMarker:  "",
+		Objects:     objectInfos,
+		Prefixes:    []string{},
+	}, nil
 }
 
 func (co *cassandraObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int,
 	fetchOwner bool, startAfter string) (loi minio.ListObjectsV2Info, err error) {
-	return loi, err
+	// fetchOwner is not supported and unused.
+	marker := continuationToken
+	if marker == "" {
+		marker = startAfter
+	}
+	resultV1, err := co.ListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
+	if err != nil {
+		return loi, err
+	}
+	return minio.ListObjectsV2Info{
+		Objects:               resultV1.Objects,
+		Prefixes:              resultV1.Prefixes,
+		ContinuationToken:     continuationToken,
+		NextContinuationToken: resultV1.NextMarker,
+		IsTruncated:           resultV1.IsTruncated,
+	}, nil
 }
 
 func (co *cassandraObjects) DeleteObject(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
@@ -178,7 +204,23 @@ func (co *cassandraObjects) GetObjectInfo(ctx context.Context, bucket, object st
 }
 
 func (co *cassandraObjects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	return minio.ObjectInfo{}, nil
+	blobs, err := io.ReadAll(r)
+	if err != nil {
+		return objInfo, cassandraToObjectErr(ctx, err, bucket, object)
+	}
+	if err = co.insertToBucket(bucket, object, blobs); err != nil {
+		return objInfo, cassandraToObjectErr(ctx, err, bucket, object)
+	}
+	return minio.ObjectInfo{
+		Bucket: bucket,
+		Name:   object,
+		ETag:   r.MD5CurrentHexString(),
+		// todo: it's not correct for ModTime and AccTime
+		ModTime: time.Now(),
+		Size:    int64(len(blobs)),
+		IsDir:   false,
+		AccTime: time.Now(),
+	}, nil
 }
 
 func (co *cassandraObjects) NewMultipartUpload(ctx context.Context, bucket string, object string, opts minio.ObjectOptions) (uploadID string, err error) {
@@ -232,7 +274,7 @@ func (co *cassandraObjects) createBucket(bucket string) error {
 		return err
 	}
 	defer s.Close()
-	cql := fmt.Sprintf("CREATE TABLE minio.%s (\nuploadid text PRIMARY KEY,\ndata blob,\ncreate_timestamp timestamp\n);", bucket)
+	cql := fmt.Sprintf("CREATE TABLE minio.%s (object_name text PRIMARY KEY, uploadid text, data blob, size int, create_timestamp timestamp);", bucket)
 	if err = s.Query(cql).Exec(); err != nil {
 		return err
 	}
@@ -294,6 +336,49 @@ func (co *cassandraObjects) getBucketCreateTime(bucket string) (*time.Time, erro
 	return &createTime, nil
 }
 
+func (co *cassandraObjects) insertToBucket(bucket, object string, blobs []byte) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("INSERT INTO minio.%s (object_name, create_timestamp, data, size, uploadid) VALUES (?, ?, ?, ?, ?);", bucket)
+	if err = s.Query(cql, object, time.Now(), typeAsBlobs(blobs), len(blobs), minio.MustGetUUID()).Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (co *cassandraObjects) getObjectInfos(bucket string) ([]minio.ObjectInfo, error) {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	var name string
+	var createTime time.Time
+	var size int64
+	var uploadId string
+	cql := fmt.Sprintf("SELECT object_name, create_timestamp, size, uploadId FROM minio.%s;", bucket)
+	iter := s.Query(cql).Iter().Scanner()
+	objectInfos := make([]minio.ObjectInfo, 0)
+	for iter.Next() {
+		err = iter.Scan(&name, &createTime, &size, &uploadId)
+		if err != nil {
+			return nil, err
+		}
+		objectInfos = append(objectInfos, minio.ObjectInfo{
+			Bucket:  bucket,
+			Name:    name,
+			ModTime: createTime,
+			Size:    size,
+			IsDir:   false,
+			AccTime: createTime,
+		})
+	}
+	return objectInfos, nil
+}
+
 func isBucketReserved(bucket string) bool {
 	return strings.Contains(reservedBuckets, bucket)
 }
@@ -301,6 +386,10 @@ func isBucketReserved(bucket string) bool {
 // cassandraIsValidBucketName verifies whether a bucket name is valid.
 func cassandraIsValidBucketName(bucket string) bool {
 	return s3utils.CheckValidBucketNameStrict(bucket) == nil
+}
+
+func typeAsBlobs(blobs []byte) string {
+	return fmt.Sprintf("0x%x", blobs)
 }
 
 func cassandraToObjectErr(ctx context.Context, err error, params ...string) error {

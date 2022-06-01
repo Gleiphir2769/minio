@@ -77,6 +77,27 @@ func TestCassandraObjects_GetBucketCreateTime(t *testing.T) {
 	}
 }
 
+func TestInsertToBucket(t *testing.T) {
+	co := &cassandraObjects{}
+	co.cluster = gocql.NewCluster("10.112.186.147")
+	err := co.insertToBucket("shenjiaqi", "test", []byte("hala madrid"))
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestCassandraObjects_GetObjectInfo(t *testing.T) {
+	co, _ := mockCassandraObject()
+	objs, err := co.getObjectInfos("shenjiaqi")
+	if err != nil {
+		t.Error(err)
+	}
+	fmt.Println(len(objs))
+	for _, obj := range objs {
+		fmt.Println(obj)
+	}
+}
+
 func mockCassandraObject() (*cassandraObjects, error) {
 	co := &cassandraObjects{}
 	co.cluster = gocql.NewCluster("10.112.186.147")
