@@ -98,6 +98,10 @@ func TestCassandraObjects_GetObjectInfo(t *testing.T) {
 	}
 }
 
+func TestHexToString(t *testing.T) {
+
+}
+
 func mockCassandraObject() (*cassandraObjects, error) {
 	co := &cassandraObjects{}
 	co.cluster = gocql.NewCluster("10.112.186.147")

@@ -1,7 +1,9 @@
 package cassandra
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"github.com/gocql/gocql"
 	"github.com/minio/cli"
@@ -180,27 +182,80 @@ func (co *cassandraObjects) ListObjectsV2(ctx context.Context, bucket, prefix, c
 }
 
 func (co *cassandraObjects) DeleteObject(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	return minio.ObjectInfo{}, nil
+	err := cassandraToObjectErr(ctx, co.deleteObject(bucket, object), bucket, object)
+	return minio.ObjectInfo{
+		Bucket: bucket,
+		Name:   object,
+	}, err
 }
 
 func (co *cassandraObjects) DeleteObjects(ctx context.Context, bucket string, objects []minio.ObjectToDelete, opts minio.ObjectOptions) ([]minio.DeletedObject, []error) {
+	errs := make([]error, len(objects))
+	dobjects := make([]minio.DeletedObject, len(objects))
+	for idx, object := range objects {
+		_, errs[idx] = co.DeleteObject(ctx, bucket, object.ObjectName, opts)
+		if errs[idx] == nil {
+			dobjects[idx] = minio.DeletedObject{
+				ObjectName: object.ObjectName,
+			}
+		}
+	}
 	return nil, nil
 }
 
 func (co *cassandraObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (gr *minio.GetObjectReader, err error) {
-	return nil, err
+	objInfo, err := co.GetObjectInfo(ctx, bucket, object, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var startOffset, length int64
+	startOffset, length, err = rs.GetOffsetLength(objInfo.Size)
+	if err != nil {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		nerr := co.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
+		pw.CloseWithError(nerr)
+	}()
+
+	// Setup cleanup function to cause the above go-routine to
+	// exit in case of partial read
+	pipeCloser := func() { pr.Close() }
+	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts, pipeCloser)
 }
 
 func (co *cassandraObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	return minio.ObjectInfo{}, nil
+	if minio.IsStringEqual(srcBucket, dstBucket) && minio.IsStringEqual(srcObject, dstObject) {
+		return co.GetObjectInfo(ctx, srcBucket, srcObject, srcOpts)
+	}
+	return co.PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, minio.ObjectOptions{
+		ServerSideEncryption: dstOpts.ServerSideEncryption,
+		UserDefined:          srcInfo.UserDefined,
+	})
 }
 
 func (co *cassandraObjects) GetObject(ctx context.Context, bucket, key string, startOffset, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
-	return nil
+	data, err := co.getObjectData(bucket, key)
+	if err != nil {
+		return cassandraToObjectErr(ctx, err, bucket, key)
+	}
+	rd := bytes.NewReader(data)
+	_, err = io.Copy(writer, io.NewSectionReader(rd, startOffset, length))
+	if err == io.EOF {
+		err = nil
+	}
+	return cassandraToObjectErr(ctx, err, bucket, key)
 }
 
 func (co *cassandraObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	return minio.ObjectInfo{}, nil
+	info, err := co.getObjectInfo(bucket, object)
+	if err != nil {
+		return objInfo, cassandraToObjectErr(ctx, err, bucket, object)
+	}
+	return *info, nil
 }
 
 func (co *cassandraObjects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
@@ -379,6 +434,57 @@ func (co *cassandraObjects) getObjectInfos(bucket string) ([]minio.ObjectInfo, e
 	return objectInfos, nil
 }
 
+func (co *cassandraObjects) getObjectInfo(bucket string, object string) (*minio.ObjectInfo, error) {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	var name string
+	var createTime time.Time
+	var size int64
+	var uploadId string
+	cql := fmt.Sprintf("SELECT object_name, create_timestamp, size, uploadId FROM minio.%s where object_name=? LIMIT 1;", bucket)
+	if err = s.Query(cql, object).Consistency(gocql.One).Scan(&name, &createTime, &size, &uploadId); err != nil {
+		return nil, err
+	}
+	return &minio.ObjectInfo{
+		Bucket:  bucket,
+		Name:    name,
+		ModTime: createTime,
+		Size:    size,
+		IsDir:   false,
+		AccTime: createTime,
+	}, nil
+}
+
+func (co *cassandraObjects) getObjectData(bucket string, object string) ([]byte, error) {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	var rawBlobs string
+	cql := fmt.Sprintf("SELECT data FROM minio.%s where object_name=? LIMIT 1;", bucket)
+	if err = s.Query(cql, object).Consistency(gocql.One).Scan(&rawBlobs); err != nil {
+		return nil, err
+	}
+	return hex.DecodeString(rawBlobs)
+}
+
+func (co *cassandraObjects) deleteObject(bucket string, object string) error {
+	s, err := co.cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cql := fmt.Sprintf("DELETE FROM minio.%s where object_name=?;", bucket)
+	if err = s.Query(cql, object).Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func isBucketReserved(bucket string) bool {
 	return strings.Contains(reservedBuckets, bucket)
 }
@@ -389,7 +495,7 @@ func cassandraIsValidBucketName(bucket string) bool {
 }
 
 func typeAsBlobs(blobs []byte) string {
-	return fmt.Sprintf("0x%x", blobs)
+	return hex.EncodeToString(blobs)
 }
 
 func cassandraToObjectErr(ctx context.Context, err error, params ...string) error {
