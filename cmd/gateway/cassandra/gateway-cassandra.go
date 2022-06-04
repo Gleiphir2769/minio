@@ -317,6 +317,9 @@ func (co *cassandraObjects) createManagedBucketsTable() error {
 		return err
 	}
 	defer s.Close()
+	if err = s.Query("CREATE KEYSPACE IF NOT EXISTS minio WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : '1' };").Exec(); err != nil {
+		return err
+	}
 	if err = s.Query("CREATE TABLE IF NOT EXISTS minio.managed_buckets (bucket_name text PRIMARY KEY, create_timestamp timestamp);").Exec(); err != nil {
 		return err
 	}
